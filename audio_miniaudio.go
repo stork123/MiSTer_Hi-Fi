@@ -59,7 +59,7 @@ func nativeAudioStartTrack(t Track, eq EQConfig) error {
 	return nil
 }
 
-func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
+func nativeAudioStartURL(rawURL string, eq EQConfig, onTitle func(string)) (func(), error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -67,7 +67,7 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "MiSTer-Hi-Fi/"+version)
-	req.Header.Set("Icy-MetaData", "0")
+	req.Header.Set("Icy-MetaData", "1")
 	req.Header.Set("Accept", "audio/*,*/*;q=0.8")
 	req.Close = true
 	resp, err := radioHTTPClient.Do(req)
@@ -80,8 +80,16 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 		cancel()
 		return nil, fmt.Errorf("radio stream returned %s", resp.Status)
 	}
+	metaInt := parseMetaInt(resp.Header.Get("icy-metaint"))
 	br := bufio.NewReaderSize(resp.Body, 16384)
-	probe, _ := br.Peek(8192)
+	probeLen := 8192
+	if metaInt > 0 && metaInt < probeLen {
+		// Never let the format-sniffing probe read past the first ICY
+		// metadata block boundary, or it could mistake interleaved metadata
+		// bytes for audio and misdetect (or fail to detect) the codec.
+		probeLen = metaInt
+	}
+	probe, _ := br.Peek(probeLen)
 	encoding := radioEncodingHint(probe, resp.Header.Get("Content-Type"), rawURL)
 	switch encoding {
 	case 6:
@@ -97,9 +105,11 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 		cancel()
 		return nil, errors.New("unsupported or unrecognized radio stream format")
 	}
+	preConsumed := 0
 	if encoding == 2 {
 		if off := firstMP3FrameOffset(probe); off > 0 {
 			_, _ = br.Discard(off)
+			preConsumed = off
 		}
 	}
 
@@ -114,7 +124,7 @@ func nativeAudioStartURL(rawURL string, eq EQConfig) (func(), error) {
 		defer close(done)
 		defer w.Close()
 		defer resp.Body.Close()
-		_, _ = io.Copy(w, br)
+		_ = icyCopy(w, br, metaInt, preConsumed, onTitle)
 	}()
 
 	enabled := C.int(0)

@@ -43,24 +43,25 @@ var screenSaverSeconds atomic.Int64
 var screenSaverActive atomic.Bool
 
 type Config struct {
-	EQ                    EQConfig `json:"eq"`
-	Visualizer            string   `json:"visualizer"`
-	OLEDMode              bool     `json:"oled_mode"`
-	HideAlbumArt          bool     `json:"hide_album_art"`
-	AutoHideMissingArt    bool     `json:"auto_hide_missing_art"`
-	PrioritizeExternalArt bool     `json:"prioritize_external_art"`
-	RememberShuffleLoop   bool     `json:"remember_shuffle_loop"`
-	SavedShuffle          bool     `json:"saved_shuffle"`
-	SavedLoop             bool     `json:"saved_loop"`
-	ShowClock             bool     `json:"show_clock"`
-	ConfirmOnExit         bool     `json:"confirm_on_exit"`
-	ScreenSaverSeconds    int      `json:"screensaver_seconds"`
-	GaplessPlayback       bool     `json:"gapless_playback"`
-	SwapAB                bool     `json:"swap_ab"`
-	SwapXY                bool     `json:"swap_xy"`
-	CustomFont            string   `json:"custom_font"`
-	WebRemoteEnabled      bool     `json:"web_remote_enabled"`
-	WebRemotePort         int      `json:"web_remote_port"`
+	EQ                    EQConfig     `json:"eq"`
+	Visualizer            string       `json:"visualizer"`
+	OLEDMode              bool         `json:"oled_mode"`
+	HideAlbumArt          bool         `json:"hide_album_art"`
+	AutoHideMissingArt    bool         `json:"auto_hide_missing_art"`
+	PrioritizeExternalArt bool         `json:"prioritize_external_art"`
+	RememberShuffleLoop   bool         `json:"remember_shuffle_loop"`
+	SavedShuffle          bool         `json:"saved_shuffle"`
+	SavedLoop             bool         `json:"saved_loop"`
+	ShowClock             bool         `json:"show_clock"`
+	ConfirmOnExit         bool         `json:"confirm_on_exit"`
+	ScreenSaverSeconds    int          `json:"screensaver_seconds"`
+	GaplessPlayback       bool         `json:"gapless_playback"`
+	SwapAB                bool         `json:"swap_ab"`
+	SwapXY                bool         `json:"swap_xy"`
+	CustomFont            string       `json:"custom_font"`
+	WebRemoteEnabled      bool         `json:"web_remote_enabled"`
+	WebRemotePort         int          `json:"web_remote_port"`
+	LastFM                LastFMConfig `json:"lastfm"`
 }
 type EQConfig struct {
 	Enabled                            bool `json:"enabled"`
@@ -2205,6 +2206,34 @@ func (p *Player) commitTrackMetadata(index int, path string, meta Track) {
 	p.mu.Unlock()
 }
 
+// radioTitleCallback builds the ICY "StreamTitle changed" handler for a
+// radio track at the given queue index. It updates the on-screen Now
+// Playing text to show the real song (when the stream provides one) and
+// reports the change to Last.fm, splitting the common "Artist - Title"
+// StreamTitle convention when present.
+func (p *Player) radioTitleCallback(index int, station Track, cfg Config) func(string) {
+	return func(streamTitle string) {
+		artist, title := splitArtistTitle(streamTitle)
+		meta := station
+		if title != "" {
+			meta.Title = title
+			meta.Artist = artist
+		} else {
+			meta.Title = streamTitle
+			meta.Artist = ""
+		}
+		p.commitTrackMetadata(index, station.Path, meta)
+
+		if title == "" {
+			return
+		}
+		// The station name (station.Title) is intentionally not sent as the
+		// Last.fm album - StreamTitle rarely carries real album info, and
+		// Last.fm treats "album" as the song's album, not the radio station.
+		lastfmTrackStarted(cfg.LastFM, artist, title, "", 0)
+	}
+}
+
 func (p *Player) loadCurrentMetadata(index int, src Track) {
 	if strings.HasPrefix(src.Path, "cdda:") || isHTTPURL(src.Path) {
 		return
@@ -2405,7 +2434,7 @@ func (p *Player) playCurrentUnlocked() error {
 		err = p.playVirtualCDTrack(t, stop)
 	} else if isHTTPURL(t.Path) {
 		var cancel func()
-		cancel, err = nativeAudioStartURL(t.Path, cfg.EQ)
+		cancel, err = nativeAudioStartURL(t.Path, cfg.EQ, p.radioTitleCallback(idx, t, cfg))
 		if err == nil {
 			p.mu.Lock()
 			if p.stop == stop {
@@ -2419,6 +2448,9 @@ func (p *Player) playCurrentUnlocked() error {
 		err = nativeAudioStartTrack(t, cfg.EQ)
 		if err == nil {
 			p.loadCurrentMetadata(idx, t)
+			if cur := p.current(); cur != nil {
+				lastfmTrackStarted(cfg.LastFM, cur.Artist, cur.Title, cur.Album, cur.Duration)
+			}
 		}
 	}
 	if err != nil {
@@ -2551,11 +2583,12 @@ func (p *Player) restartRadioStream(oldStop <-chan struct{}, oldGeneration uint6
 			p.opMu.Unlock()
 			return
 		}
-		t := p.q.Tracks[p.q.Index]
+		idx := p.q.Index
+		t := p.q.Tracks[idx]
 		cfg := p.cfg
 		p.mu.Unlock()
 
-		cancel, err := nativeAudioStartURL(t.Path, cfg.EQ)
+		cancel, err := nativeAudioStartURL(t.Path, cfg.EQ, p.radioTitleCallback(idx, t, cfg))
 		if err == nil {
 			p.mu.Lock()
 			current = p.reconnectRadio && p.stop == stop && p.generation == generation && !p.stopped
@@ -2751,7 +2784,9 @@ func (p *Player) stopAndResetUnlocked() {
 	p.basePosition = 0
 	p.levels = [10]float64{}
 	p.gaplessQueuedIndex = -1
+	cfg := p.cfg
 	p.mu.Unlock()
+	lastfmTrackStopped(cfg.LastFM)
 }
 func (a *App) stopAndUnload() {
 	if a.player == nil {
@@ -5100,6 +5135,10 @@ func main() {
 	_ = os.MkdirAll(smbMountRoot, 0755)
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
 		fmt.Println("MiSTer Hi-Fi v" + version)
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "--lastfm-auth" {
+		runLastFMAuthCLI()
 		return
 	}
 	if len(os.Args) > 1 && os.Args[1] == "--send" {

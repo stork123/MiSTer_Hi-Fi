@@ -219,6 +219,45 @@ AAC and ALAC remain supported when contained in normal M4A/MP4 music files. Supp
 
 If an Online Radio stream ends unexpectedly, MiSTer Hi-Fi automatically reconnects to the same station. This helps stations that close or restart their stream connection between songs and also improves recovery from short interruptions. Explicitly stopping playback or selecting another station cancels the reconnect.
 
+## Last.fm Scrobbling
+
+MiSTer Hi-Fi can scrobble what you're playing to [Last.fm](https://www.last.fm) - both local files and Online Radio stations. For radio, it reads the ICY metadata (`StreamTitle`) that Shoutcast/Icecast servers send between songs, so scrobbles reflect the actual song currently on air rather than just the station name. Stations that don't send metadata simply won't scrobble a specific song.
+
+### Setup
+
+1. Create a Last.fm API application at <https://www.last.fm/api/account/create> (any name/description works) to get an **API key** and **shared secret**.
+2. On the MiSTer, run the one-time authorization flow from a terminal:
+
+   ```sh
+   /media/fat/Scripts/.config/MiSTerHiFi/mister_hifi --lastfm-auth
+   ```
+
+3. Enter your API key and secret when prompted (only needed the first time).
+4. Open the URL it prints in any browser - your phone works fine, it doesn't need to be on the MiSTer itself - and click **Allow**.
+5. Back in the terminal, press Enter. On success, a permanent session key is saved to `config.json` and scrobbling is enabled.
+
+Your Last.fm password is never sent to or stored by MiSTer Hi-Fi - only the session key Last.fm issues after you approve access, which you can revoke at any time from your [Last.fm application settings](https://www.last.fm/settings/applications).
+
+### What gets scrobbled
+
+A track is scrobbled once it has played for at least half its length (or 4 minutes, whichever is shorter), matching [Last.fm's scrobbling rules](https://www.last.fm/api/scrobbling). Since Online Radio has no known track length ahead of time, radio songs are scrobbled once they've played for at least 30 seconds and either the station's `StreamTitle` changes to a new song or playback stops.
+
+### Configuration
+
+The `lastfm` section of `config.json` holds these settings:
+
+```json
+"lastfm": {
+  "enabled": true,
+  "api_key": "your-api-key",
+  "api_secret": "your-shared-secret",
+  "session_key": "issued-after-auth",
+  "username": "your-lastfm-username"
+}
+```
+
+Set `"enabled": false` to pause scrobbling without losing your saved session key.
+
 ## Launching
 
 Open MiSTer Hi-Fi normally:

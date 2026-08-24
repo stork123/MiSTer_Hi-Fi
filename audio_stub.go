@@ -7,7 +7,7 @@ import "errors"
 func nativeAudioStartTrack(Track, EQConfig) error {
 	return errors.New("MiSTer Hi-Fi audio engine requires a CGO build")
 }
-func nativeAudioStartURL(string, EQConfig) (func(), error) {
+func nativeAudioStartURL(string, EQConfig, func(string)) (func(), error) {
 	return nil, errors.New("MiSTer Hi-Fi audio engine requires a CGO build")
 }
 func nativeAudioStartPCM(EQConfig) error {
