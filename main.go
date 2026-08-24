@@ -30,7 +30,7 @@ import (
 	taglib "github.com/dhowden/tag"
 )
 
-const version = "1.10.0"
+const version = "1.9.1"
 const baseDir = "/media/fat/Scripts/.config/MiSTerHiFi"
 const socketPath = "/tmp/misterhifi.sock"
 const smbMountRoot = "/tmp/misterhifi-mnt"
@@ -2210,7 +2210,13 @@ func (p *Player) commitTrackMetadata(index int, path string, meta Track) {
 // radio track at the given queue index. It updates the on-screen Now
 // Playing text to show the real song (when the stream provides one) and
 // reports the change to Last.fm, splitting the common "Artist - Title"
-// StreamTitle convention when present.
+// StreamTitle convention when present. Radio streams reconnect often (see
+// radioStallTimeout in monitorPlayback), and each reconnect re-announces
+// whatever StreamTitle the server is currently sending, which is very often
+// just the same song echoed back rather than a genuine change; filtering
+// that out is handled centrally in lastfmTrackStarted (see lastfm.go)
+// rather than here, since that's also where the timing state it depends on
+// actually lives.
 func (p *Player) radioTitleCallback(index int, station Track, cfg Config) func(string) {
 	return func(streamTitle string) {
 		artist, title := splitArtistTitle(streamTitle)
@@ -2252,6 +2258,21 @@ func (p *Player) loadCurrentMetadata(index int, src Track) {
 		}
 	}
 
+	// MP3's Title/Artist only ever got read in the async goroutine below (via
+	// trackFromTrack), which meant lastfmTrackStarted (called synchronously,
+	// right after loadCurrentMetadata returns, from playCurrentUnlocked) saw
+	// an empty title for every MP3 and silently skipped scrobbling it - see
+	// the "if title == \"\" { return }" guard in lastfm.go. Reading the ID3
+	// tags synchronously here, the same way FLAC and M4A already do below,
+	// makes sure a real title/artist is committed before that call happens.
+	if ext == ".mp3" {
+		meta := src
+		meta.MediaFormat = "MP3"
+		readMP3InfoWithRetry(&meta)
+		readID3WithRetry(&meta)
+		p.commitTrackMetadata(index, src.Path, meta)
+	}
+
 	if ext == ".m4a" {
 		if codec, rate, bits, duration, err := nativeM4AProbeTrack(src); err == nil {
 			meta := src
@@ -2272,6 +2293,27 @@ func (p *Player) loadCurrentMetadata(index int, src Track) {
 					}
 					_ = f.Close()
 				}
+			}
+			// The native probe above only reports audio format/duration, not
+			// the Title/Artist tags - those come from the M4A/MP4 atoms via
+			// taglib. Read just the text tags here (skip the cover art
+			// decode; that stays in the async pass below like it already
+			// does for every other format) so a real title is committed
+			// before lastfmTrackStarted is called, same reasoning as MP3
+			// above.
+			if f, openErr := openTrackFile(meta); openErr == nil {
+				if tagFile, tagErr := taglib.ReadFrom(f); tagErr == nil {
+					if v := strings.TrimSpace(tagFile.Title()); v != "" {
+						meta.Title = v
+					}
+					if v := strings.TrimSpace(tagFile.Artist()); v != "" {
+						meta.Artist = v
+					}
+					if v := strings.TrimSpace(tagFile.Album()); v != "" {
+						meta.Album = v
+					}
+				}
+				_ = f.Close()
 			}
 			p.commitTrackMetadata(index, src.Path, meta)
 		}
