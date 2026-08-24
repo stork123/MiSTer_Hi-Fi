@@ -17,7 +17,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"path/filepath"
