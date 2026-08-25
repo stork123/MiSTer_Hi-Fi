@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1289,9 +1291,13 @@ func onlineArtworkForTrack(t Track) image.Image {
 	}
 	onlineArtMu.Unlock()
 
-	im, data := fetchITunesArtwork(artist, title)
-	if im != nil && t.Path != "" {
-		saveFolderArtwork(filepath.Dir(t.Path), data)
+	im := loadCachedArtwork(artist, title)
+	if im == nil {
+		var data []byte
+		im, data = fetchITunesArtwork(artist, title)
+		if im != nil {
+			saveCachedArtwork(artist, title, data)
+		}
 	}
 
 	onlineArtMu.Lock()
@@ -1348,33 +1354,51 @@ func fetchITunesArtwork(artist, title string) (image.Image, []byte) {
 	return im, data
 }
 
-// saveFolderArtwork writes downloaded artwork next to a track as cover.jpg
-// so future plays (of this or any other track in the same folder) find it
-// via the normal folder-art lookup and never need the network again. It
-// only writes when the folder has no recognized art file already - never
-// overwriting something a user (or a previous lookup) already placed
-// there - and any failure (read-only mount, permissions, network share
-// quirks) is silently ignored, same as every other artwork source here.
-func saveFolderArtwork(dir string, data []byte) {
-	if dir == "" || len(data) == 0 {
-		return
-	}
-	es, err := os.ReadDir(dir)
+// artCacheDir stores downloaded album art on the MiSTer's own local storage,
+// independent of wherever the music itself lives. Network shares are
+// intentionally mounted read-only (see mountShare's "ro" mount option) so
+// this app can never write to them under any circumstances, so looked-up
+// art for tracks on a network drive - or anywhere else - persists here
+// instead of next to the track.
+var artCacheDir = filepath.Join(baseDir, "artcache")
+
+// artCacheKey turns an artist/title pair into a stable, filesystem-safe
+// cache filename. iTunes artwork downloads as JPEG.
+func artCacheKey(artist, title string) string {
+	sum := sha1.Sum([]byte(strings.ToLower(artist) + "|" + strings.ToLower(title)))
+	return hex.EncodeToString(sum[:]) + ".jpg"
+}
+
+// loadCachedArtwork returns previously-downloaded art for this artist/title
+// from local disk, or nil if nothing's cached yet (including if it hasn't
+// been looked up before, or the disk read/decode fails for any reason).
+func loadCachedArtwork(artist, title string) image.Image {
+	f, err := os.Open(filepath.Join(artCacheDir, artCacheKey(artist, title)))
 	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	im, _, err := image.Decode(f)
+	if err != nil {
+		return nil
+	}
+	return im
+}
+
+// saveCachedArtwork persists downloaded artwork to the local cache so future
+// lookups for the same artist/title - on this track or any other with the
+// same tags - never need the network again, regardless of where the track
+// file itself lives or whether that location is writable. Any failure
+// (out of space, permissions) is silently ignored, same as every other
+// artwork source here.
+func saveCachedArtwork(artist, title string, data []byte) {
+	if len(data) == 0 {
 		return
 	}
-	for _, e := range es {
-		if e.IsDir() {
-			continue
-		}
-		name := strings.ToLower(e.Name())
-		for _, known := range folderArtworkNames {
-			if name == known {
-				return
-			}
-		}
+	if err := os.MkdirAll(artCacheDir, 0755); err != nil {
+		return
 	}
-	_ = os.WriteFile(filepath.Join(dir, "cover.jpg"), data, 0644)
+	_ = os.WriteFile(filepath.Join(artCacheDir, artCacheKey(artist, title)), data, 0644)
 }
 
 func trackFromTrack(src Track, prioritizeExternalArt bool) Track {
