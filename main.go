@@ -52,6 +52,7 @@ type Config struct {
 	HideAlbumArt          bool         `json:"hide_album_art"`
 	AutoHideMissingArt    bool         `json:"auto_hide_missing_art"`
 	PrioritizeExternalArt bool         `json:"prioritize_external_art"`
+	RecursiveFolders      bool         `json:"recursive_folders"`
 	RememberShuffleLoop   bool         `json:"remember_shuffle_loop"`
 	SavedShuffle          bool         `json:"saved_shuffle"`
 	SavedLoop             bool         `json:"saved_loop"`
@@ -350,6 +351,27 @@ func (fb *framebuffer) presentRegion(x, y, w, h int) {
 	}
 	fb.captureFramebufferSamplesLocked(x, y, w, h)
 }
+
+// presentScreensaverFrame flushes the back buffer to the real framebuffer the
+// same way present() does, but without the screenSaverActive guard, since it
+// is only ever called by the screensaver visualizer itself while the screen
+// is meant to be showing the animated bars.
+func (fb *framebuffer) presentScreensaverFrame() {
+	if fb == nil || len(fb.back) == 0 || len(fb.data) == 0 {
+		return
+	}
+	fb.presentMu.Lock()
+	defer fb.presentMu.Unlock()
+	n := fb.stride * fb.h
+	if n > len(fb.back) {
+		n = len(fb.back)
+	}
+	if n > len(fb.data) {
+		n = len(fb.data)
+	}
+	copy(fb.data[:n], fb.back[:n])
+	fb.captureFramebufferSamplesLocked(0, 0, fb.w, fb.h)
+}
 func customFallbackPixelHeight(s int) int {
 	if s < 1 {
 		s = 1
@@ -602,6 +624,101 @@ func screenSaverInputLoop(fb *framebuffer, raw <-chan action, out chan<- action,
 				screenSaverActive.Store(true)
 				sleeping = true
 			}
+		}
+	}
+}
+
+// screenSaverBarColor picks a classic equalizer LED color for a segment based
+// on how far up the bar it sits (green low, yellow mid, red near the top).
+func screenSaverBarColor(frac float64) color.RGBA {
+	switch {
+	case frac > 0.82:
+		return color.RGBA{220, 60, 60, 255}
+	case frac > 0.55:
+		return color.RGBA{225, 190, 60, 255}
+	default:
+		return color.RGBA{70, 200, 120, 255}
+	}
+}
+
+// drawScreenSaverBars renders a full-screen, segmented-LED-style spectrum
+// visualizer into fb's back buffer. When active is false (nothing playing)
+// it falls back to a gentle synthetic wave so the screensaver still looks
+// alive; when active is true it reacts to the real levels in lv.
+func drawScreenSaverBars(fb *framebuffer, lv [10]float64, active bool, t float64) {
+	fb.fill(color.RGBA{0, 0, 0, 255})
+	n := len(lv)
+	marginX := fb.w / 20
+	if marginX < 4 {
+		marginX = 4
+	}
+	usableW := fb.w - marginX*2
+	gap := usableW / (n * 8)
+	if gap < 2 {
+		gap = 2
+	}
+	bw := (usableW - gap*(n-1)) / n
+	if bw < 2 {
+		bw = 2
+	}
+	baseY := fb.h - fb.h/10
+	maxH := fb.h * 7 / 10
+	segH := maxH / 16
+	if segH < 3 {
+		segH = 3
+	}
+	for i := 0; i < n; i++ {
+		v := lv[i]
+		if !active {
+			v = 0.14 + 0.10*math.Sin(t*0.9+float64(i)*0.6)
+		}
+		if v < 0 {
+			v = 0
+		}
+		if v > 1 {
+			v = 1
+		}
+		h := int(v * float64(maxH))
+		x := marginX + i*(bw+gap)
+		segs := h / segH
+		for s := 0; s <= segs; s++ {
+			sy := baseY - (s+1)*segH
+			if sy < baseY-maxH {
+				break
+			}
+			frac := float64(s*segH) / float64(maxH)
+			fb.rect(x, sy+1, bw, segH-2, screenSaverBarColor(frac))
+		}
+	}
+}
+
+// screenSaverVisualizerLoop animates the spectrum-bar screensaver while
+// screenSaverActive is set, reading live audio levels off the current
+// player (if any) so the bars react to whatever is playing.
+func screenSaverVisualizerLoop(fb *framebuffer, app *App, done <-chan struct{}) {
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	var t float64
+	for {
+		select {
+		case <-done:
+			return
+		case <-tick.C:
+			if !screenSaverActive.Load() {
+				continue
+			}
+			t += 0.05
+			var lv [10]float64
+			active := false
+			if app != nil && app.player != nil {
+				_, snap, _, _, _, _, _, stopped := playerSnapshot(app.player)
+				if !stopped {
+					lv = snap
+					active = true
+				}
+			}
+			drawScreenSaverBars(fb, lv, active, t)
+			fb.presentScreensaverFrame()
 		}
 	}
 }
@@ -1152,6 +1269,42 @@ func audioFiles(dir string) []string {
 	sort.Slice(out, func(i, j int) bool {
 		return strings.ToLower(filepath.Base(out[i])) < strings.ToLower(filepath.Base(out[j]))
 	})
+	return out
+}
+
+// audioFilesRecursive walks dir and every subdirectory beneath it, returning
+// every supported audio file found. Ordering is depth-first and
+// alphabetical: a directory's own files are listed before it descends into
+// any subdirectories, and both files and subdirectories are visited in
+// case-insensitive name order at each level - so a typical Artist/Album/
+// tracks layout plays out album by album rather than interleaving unrelated
+// folders by coincidental filename similarity. Unreadable subdirectories
+// (permission issues, a broken network mount) are skipped rather than
+// aborting the whole scan.
+func audioFilesRecursive(dir string) []string {
+	es, e := os.ReadDir(dir)
+	if e != nil {
+		return nil
+	}
+	sort.Slice(es, func(i, j int) bool {
+		return strings.ToLower(es[i].Name()) < strings.ToLower(es[j].Name())
+	})
+	var out []string
+	for _, x := range es {
+		if x.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(x.Name()))
+		if ext == ".mp3" || ext == ".wav" || ext == ".flac" || (ext == ".ogg" || ext == ".oga") || ext == ".m4a" {
+			out = append(out, filepath.Join(dir, x.Name()))
+		}
+	}
+	for _, x := range es {
+		if !x.IsDir() {
+			continue
+		}
+		out = append(out, audioFilesRecursive(filepath.Join(dir, x.Name()))...)
+	}
 	return out
 }
 func basicTrack(p string) Track {
@@ -2059,12 +2212,16 @@ func parseM3U(p string) []string {
 	}
 	return out
 }
-func buildQueue(path string, external bool) Queue {
+func buildQueue(path string, external bool, recursive bool) Queue {
+	listDir := audioFiles
+	if recursive {
+		listDir = audioFilesRecursive
+	}
 	var ps []string
 	idx := 0
 	if external {
 		if st, err := os.Stat(path); err == nil && st.IsDir() {
-			ps = audioFiles(path)
+			ps = listDir(path)
 		} else if ext := strings.ToLower(filepath.Ext(path)); ext == ".m3u" || ext == ".m3u8" {
 			ps = parseM3U(path)
 		} else {
@@ -2075,7 +2232,7 @@ func buildQueue(path string, external bool) Queue {
 		if ext == ".m3u" || ext == ".m3u8" {
 			ps = parseM3U(path)
 		} else {
-			ps = audioFiles(filepath.Dir(path))
+			ps = listDir(filepath.Dir(path))
 			for i, p := range ps {
 				if p == path {
 					idx = i
@@ -2090,14 +2247,30 @@ func buildQueue(path string, external bool) Queue {
 	return q
 }
 
-func buildQueueFromChoice(choice browseChoice) Queue {
+func buildQueueFromChoice(choice browseChoice, recursive bool) Queue {
 	if !choice.UseDirFD || choice.DirFD < 0 {
-		return buildQueue(choice.Path, false)
+		return buildQueue(choice.Path, false, recursive)
 	}
 	ext := strings.ToLower(filepath.Ext(choice.Name))
 	if ext == ".m3u" || ext == ".m3u8" {
 		_ = syscall.Close(choice.DirFD)
-		return buildQueue(choice.Path, false)
+		return buildQueue(choice.Path, false, recursive)
+	}
+	if recursive {
+		// The DirFD fast path only ever looks at the one directory it
+		// already has a handle open on; recursing into subdirectories means
+		// walking the tree by path instead; the caller's DirFD is no longer
+		// useful once that decision is made, so it's released here.
+		_ = syscall.Close(choice.DirFD)
+		ps := audioFilesRecursive(choice.Dir)
+		q := Queue{}
+		for i, p := range ps {
+			if p == choice.Path {
+				q.Index = i
+			}
+			q.Tracks = append(q.Tracks, basicTrack(p))
+		}
+		return q
 	}
 	queueFD, err := syscall.Openat(choice.DirFD, ".", syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
@@ -2216,8 +2389,9 @@ func externalQueue(raw string) (Queue, error) {
 	if e != nil {
 		return Queue{}, errors.New("file or folder not found")
 	}
+	recursive := loadConfig().RecursiveFolders
 	if st.IsDir() {
-		q := buildQueue(path, true)
+		q := buildQueue(path, true, recursive)
 		if len(q.Tracks) == 0 {
 			return Queue{}, errors.New("no supported audio files in folder")
 		}
@@ -2227,7 +2401,7 @@ func externalQueue(raw string) (Queue, error) {
 	if !supported[ext] {
 		return Queue{}, errors.New("unsupported file type")
 	}
-	q := buildQueue(path, true)
+	q := buildQueue(path, true, recursive)
 	if len(q.Tracks) == 0 {
 		if ext == ".m3u" || ext == ".m3u8" {
 			return Queue{}, errors.New("playlist contains no supported tracks")
@@ -4541,9 +4715,15 @@ func playerUI(app *App) {
 				fb.presentRegion(l.margin, ctrlTop, fb.w-l.margin*2, fb.h-ctrlTop)
 			}
 		case <-vizTick.C:
+			if screenSaverActive.Load() {
+				continue
+			}
 			drawPlayerDynamic(fb, p, l, sel, cfg)
 			fb.presentRegion(l.rightX-scaledPx(l.scale, 10), l.vizY-scaledPx(l.scale, 2), l.rightW+scaledPx(l.scale, 20), l.barY+l.barH-l.vizY+scaledPx(l.scale, 12))
 		case <-metaTick.C:
+			if screenSaverActive.Load() {
+				continue
+			}
 			k := playerTrackKey(p)
 			if k != lastTrackKey {
 				l = drawPlayerStatic(fb, p, sel, cfg)
@@ -4824,7 +5004,8 @@ func runBrowserSource(app *App, root, kind string) {
 			return
 		}
 		origin := &browseOrigin{Root: root, Dir: choice.Dir, Selected: choice.Name, Kind: kind}
-		if err := app.startQueue(buildQueueFromChoice(choice), origin); err != nil {
+		recursive := app.cfg != nil && app.cfg.RecursiveFolders
+		if err := app.startQueue(buildQueueFromChoice(choice, recursive), origin); err != nil {
 			message(app, "PLAYBACK ERROR", err.Error())
 			startDir, selected = choice.Dir, choice.Name
 			continue
@@ -4930,6 +5111,7 @@ func settingsUI(app *App) {
 		"SWAP A/B",
 		"SWAP X/Y",
 		"CUSTOM FALLBACK FONT",
+		"INCLUDE SUBFOLDERS",
 	}
 	fonts := scanCustomFonts()
 	applyCustomFont(cfg, fonts)
@@ -4984,6 +5166,7 @@ func settingsUI(app *App) {
 			onoff(cfg.SwapAB),
 			onoff(cfg.SwapXY),
 			customFontLabel(cfg, fonts),
+			onoff(cfg.RecursiveFolders),
 		}
 		ts := max(1, row/22)
 		for i := range labels {
@@ -5001,7 +5184,7 @@ func settingsUI(app *App) {
 				valueColor = color.RGBA{75, 75, 82, 255}
 				subColor = color.RGBA{70, 70, 76, 255}
 			}
-			hasSub := i == 3 || i == 4 || i == 7 || i == 8 || i == 11
+			hasSub := i == 3 || i == 4 || i == 7 || i == 8 || i == 11 || i == 12
 			labelY := y + 5
 			if hasSub {
 				labelY = y + 1
@@ -5026,6 +5209,10 @@ func settingsUI(app *App) {
 			if i == 11 {
 				subScale := max(1, ts-1)
 				fb.text(65, labelY+ts*8, subScale, fallbackFontHelp, subColor)
+			}
+			if i == 12 {
+				subScale := max(1, ts-1)
+				fb.text(65, labelY+ts*8, subScale, "PLAYING A FOLDER ALSO PLAYS EVERYTHING IN ITS SUBFOLDERS", subColor)
 			}
 			fb.text(fb.w-65-tw(ts, values[i]), y+5, ts, values[i], valueColor)
 		}
@@ -5130,6 +5317,8 @@ func settingsUI(app *App) {
 					dir = -1
 				}
 				cycleCustomFont(cfg, fonts, dir)
+			case 12:
+				cfg.RecursiveFolders = !cfg.RecursiveFolders
 			}
 			saveConfig(*cfg)
 		}
@@ -5402,6 +5591,7 @@ func main() {
 	webNowPlaying := make(chan struct{}, 1)
 	webStop := make(chan struct{}, 1)
 	app := &App{fb: fb, acts: acts, external: external, cfg: &cfg, webNowPlaying: webNowPlaying, webStop: webStop}
+	go screenSaverVisualizerLoop(fb, app, done)
 	defer cleanupSMBMounts()
 	defer func() {
 		if app.player != nil {
