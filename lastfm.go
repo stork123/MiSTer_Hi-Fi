@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,28 @@ import (
 )
 
 const lastfmAPIRoot = "https://ws.audioscrobbler.com/2.0/"
+
+// lastfmLogger writes a persistent, human-readable trail of every scrobble
+// decision to a log file next to config.json - what came in, whether it was
+// treated as an echo/new song, and (critically) what Last.fm's own API
+// response said about each submission, including its ignoredMessage field
+// when Last.fm's own server-side dedup/anti-spam logic silently drops a
+// scrobble that was otherwise accepted (HTTP 200, no error). That's
+// invisible to the rest of this program - the API call "succeeds" either
+// way - so without this log there's no way to tell "we sent something
+// broken" apart from "we sent something fine and Last.fm chose to ignore
+// it" from the MiSTer side alone. Safe to tail live over SSH:
+// tail -f /media/fat/Scripts/.config/MiSTerHiFi/lastfm.log
+var lastfmLogger = newLastfmLogger()
+
+func newLastfmLogger() *log.Logger {
+	_ = os.MkdirAll(baseDir, 0755)
+	f, err := os.OpenFile(filepath.Join(baseDir, "lastfm.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return log.New(os.Stderr, "[lastfm] ", log.LstdFlags)
+	}
+	return log.New(f, "", log.LstdFlags)
+}
 
 // LastFMConfig is stored under the "lastfm" key in config.json. SessionKey
 // is obtained once via the one-time `--lastfm-auth` setup flow (see main.go)
@@ -152,6 +175,14 @@ var (
 	lastfmPending *pendingScrobble
 )
 
+// lastfmEchoWindow bounds how soon after a track "starts" a repeat report of
+// the exact same artist/title is assumed to be an echo (e.g. a radio stream
+// reconnect re-announcing the song that was already playing) rather than a
+// genuine new play. Any track long enough to actually qualify for scrobbling
+// (see scrobbleIfQualifies) takes well over this long to legitimately loop
+// back to itself, so a real repeat listen is never mistaken for an echo.
+const lastfmEchoWindow = 20 * time.Second
+
 // lastfmTrackStarted should be called whenever a new song begins playing -
 // a local file starting, a queue advancing, or a radio station's ICY
 // StreamTitle changing to a new song. It scrobbles whatever was previously
@@ -160,12 +191,29 @@ var (
 // length in seconds if known, or 0 for radio where it isn't known in
 // advance. Safe to call even when Last.fm isn't configured (cfg.ready() ==
 // false); it becomes a no-op other than clearing/tracking pending state.
+//
+// Radio streams reconnect often (stalls, brief EOFs), and each reconnect
+// re-parses ICY metadata from scratch, so the very first StreamTitle seen
+// after a reconnect is very often just an echo of the song that was already
+// playing rather than a real change. Treating that echo as a new play would
+// restart the qualifying-time clock (so the song might never accumulate
+// enough played time to scrobble at all) and/or send a duplicate scrobble
+// that Last.fm silently discards later as spam. So a report that exactly
+// matches what's already pending, arriving within lastfmEchoWindow of when
+// that pending entry began, is ignored outright - the original startedAt
+// keeps counting instead of being reset.
 func lastfmTrackStarted(cfg LastFMConfig, artist, title, album string, durationHint float64) {
 	if title == "" {
 		return
 	}
+	lastfmLogger.Printf("started: artist=%q title=%q album=%q durationHint=%.0f", artist, title, album, durationHint)
 	lastfmMu.Lock()
 	prev := lastfmPending
+	if prev != nil && prev.artist == artist && prev.title == title && time.Since(prev.startedAt) < lastfmEchoWindow {
+		lastfmMu.Unlock()
+		lastfmLogger.Printf("  -> treated as an echo of the already-pending %q by %q (%.0fs since it started); ignored", prev.title, prev.artist, time.Since(prev.startedAt).Seconds())
+		return
+	}
 	lastfmPending = &pendingScrobble{artist: artist, title: title, album: album, startedAt: time.Now(), durationHint: durationHint}
 	lastfmMu.Unlock()
 
@@ -187,6 +235,9 @@ func lastfmTrackStarted(cfg LastFMConfig, artist, title, album string, durationH
 		}
 		if _, err := lastfmCall("track.updateNowPlaying", params, cfg.APISecret, http.MethodPost); err != nil {
 			log.Printf("last.fm: now playing update failed: %v", err)
+			lastfmLogger.Printf("  -> now playing update FAILED for %q by %q: %v", title, artist, err)
+		} else {
+			lastfmLogger.Printf("  -> now playing update sent for %q by %q", title, artist)
 		}
 	}()
 }
@@ -201,6 +252,7 @@ func lastfmTrackStopped(cfg LastFMConfig) {
 	lastfmPending = nil
 	lastfmMu.Unlock()
 	if prev != nil && cfg.ready() {
+		lastfmLogger.Printf("stopped: flushing pending %q by %q", prev.title, prev.artist)
 		go scrobbleIfQualifies(cfg, prev)
 	}
 }
@@ -223,6 +275,7 @@ func scrobbleIfQualifies(cfg LastFMConfig, s *pendingScrobble) {
 		}
 	}
 	if played < minPlayed {
+		lastfmLogger.Printf("  -> NOT scrobbling %q by %q: only played %.0fs, needed %.0fs", s.title, s.artist, played, minPlayed)
 		return
 	}
 
@@ -236,9 +289,46 @@ func scrobbleIfQualifies(cfg LastFMConfig, s *pendingScrobble) {
 	if s.album != "" {
 		params["album"] = s.album
 	}
-	if _, err := lastfmCall("track.scrobble", params, cfg.APISecret, http.MethodPost); err != nil {
+	out, err := lastfmCall("track.scrobble", params, cfg.APISecret, http.MethodPost)
+	if err != nil {
 		log.Printf("last.fm: scrobble failed for %q: %v", s.title, err)
+		lastfmLogger.Printf("  -> scrobble API CALL FAILED for %q by %q @ %s (unix %d, played %.0fs): %v",
+			s.title, s.artist, s.startedAt.Format(time.RFC3339), s.startedAt.Unix(), played, err)
+		return
 	}
+	logScrobbleOutcome(s, played, out)
+}
+
+// logScrobbleOutcome inspects Last.fm's track.scrobble response body. A
+// scrobble can come back as a plain HTTP success (no "error" key, so
+// lastfmCall doesn't treat it as a failure) while Last.fm's own
+// server-side logic still silently marks it "ignored" - duplicate,
+// suspicious timing, rate limit, etc. - via scrobbles.scrobble.ignoredMessage.
+// That's the one place the API actually tells us why something we sent
+// wouldn't stick, so it's worth surfacing explicitly rather than only
+// logging outright transport/auth failures.
+func logScrobbleOutcome(s *pendingScrobble, played float64, out map[string]interface{}) {
+	when := s.startedAt.Format(time.RFC3339)
+	scrobbles, _ := out["scrobbles"].(map[string]interface{})
+	if scrobbles == nil {
+		lastfmLogger.Printf("  -> scrobble submitted for %q by %q @ %s (unix %d, played %.0fs); unexpected response shape: %v",
+			s.title, s.artist, when, s.startedAt.Unix(), played, out)
+		return
+	}
+	entry, _ := scrobbles["scrobble"].(map[string]interface{})
+	if entry != nil {
+		if im, ok := entry["ignoredMessage"].(map[string]interface{}); ok {
+			code, _ := im["code"].(string)
+			if code != "" && code != "0" {
+				text, _ := im["#text"].(string)
+				lastfmLogger.Printf("  -> scrobble IGNORED BY LAST.FM for %q by %q @ %s (unix %d, played %.0fs): code=%s %q",
+					s.title, s.artist, when, s.startedAt.Unix(), played, code, text)
+				return
+			}
+		}
+	}
+	lastfmLogger.Printf("  -> scrobble accepted for %q by %q @ %s (unix %d, played %.0fs)",
+		s.title, s.artist, when, s.startedAt.Unix(), played)
 }
 
 func nonEmptyOr(v, fallback string) string {
