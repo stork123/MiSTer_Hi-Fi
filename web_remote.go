@@ -464,7 +464,7 @@ func (w *webRemote) handlePlay(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, "unsupported track", 400)
 			return
 		}
-		q = buildQueue(path, false)
+		q = buildQueue(path, false, w.app.cfg != nil && w.app.cfg.RecursiveFolders)
 		origin = &browseOrigin{Root: root, Dir: filepath.Dir(path), Selected: filepath.Base(path), Kind: kind}
 	}
 	if err := w.app.startQueue(q, origin); err != nil {
