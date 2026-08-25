@@ -1289,7 +1289,10 @@ func onlineArtworkForTrack(t Track) image.Image {
 	}
 	onlineArtMu.Unlock()
 
-	im := fetchITunesArtwork(artist, title)
+	im, data := fetchITunesArtwork(artist, title)
+	if im != nil && t.Path != "" {
+		saveFolderArtwork(filepath.Dir(t.Path), data)
+	}
 
 	onlineArtMu.Lock()
 	onlineArtCache[key] = im
@@ -1297,16 +1300,19 @@ func onlineArtworkForTrack(t Track) image.Image {
 	return im
 }
 
-func fetchITunesArtwork(artist, title string) image.Image {
+// fetchITunesArtwork returns both the decoded image (for immediate display)
+// and the raw downloaded bytes (so the caller can save exactly what was
+// downloaded to disk without a lossy decode/re-encode round trip).
+func fetchITunesArtwork(artist, title string) (image.Image, []byte) {
 	term := url.QueryEscape(artist + " " + title)
 	searchURL := "https://itunes.apple.com/search?media=music&entity=song&limit=1&term=" + term
 	resp, err := onlineArtHTTPClient.Get(searchURL)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil
+		return nil, nil
 	}
 
 	var result struct {
@@ -1315,11 +1321,11 @@ func fetchITunesArtwork(artist, title string) image.Image {
 		} `json:"results"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Results) == 0 {
-		return nil
+		return nil, nil
 	}
 	artURL := result.Results[0].ArtworkURL100
 	if artURL == "" {
-		return nil
+		return nil, nil
 	}
 	// iTunes serves a 100x100 thumbnail by default, but every size up to at
 	// least 600x600 is available at the same path by swapping the
@@ -1328,14 +1334,47 @@ func fetchITunesArtwork(artist, title string) image.Image {
 
 	imResp, err := onlineArtHTTPClient.Get(artURL)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	defer imResp.Body.Close()
-	im, _, err := image.Decode(imResp.Body)
+	data, err := io.ReadAll(imResp.Body)
 	if err != nil {
-		return nil
+		return nil, nil
 	}
-	return im
+	im, _, err := image.Decode(bytes.NewReader(data))
+	if err != nil {
+		return nil, nil
+	}
+	return im, data
+}
+
+// saveFolderArtwork writes downloaded artwork next to a track as cover.jpg
+// so future plays (of this or any other track in the same folder) find it
+// via the normal folder-art lookup and never need the network again. It
+// only writes when the folder has no recognized art file already - never
+// overwriting something a user (or a previous lookup) already placed
+// there - and any failure (read-only mount, permissions, network share
+// quirks) is silently ignored, same as every other artwork source here.
+func saveFolderArtwork(dir string, data []byte) {
+	if dir == "" || len(data) == 0 {
+		return
+	}
+	es, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	for _, e := range es {
+		if e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		for _, known := range folderArtworkNames {
+			if name == known {
+				return
+			}
+		}
+	}
+	_ = os.WriteFile(filepath.Join(dir, "cover.jpg"), data, 0644)
 }
 
 func trackFromTrack(src Track, prioritizeExternalArt bool) Track {
