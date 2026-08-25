@@ -14,6 +14,7 @@ import (
 	"io"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
@@ -1255,6 +1256,88 @@ func externalArtworkForTrack(t Track) image.Image {
 	return folderArtwork(filepath.Dir(t.Path))
 }
 
+var onlineArtHTTPClient = &http.Client{Timeout: 8 * time.Second}
+
+// onlineArtCache remembers artwork lookups for the session so replaying a
+// track doesn't re-query the network every time. A nil entry is a cached
+// "nothing found" - it still counts as checked, so a track with no art
+// anywhere isn't re-queried on every repeat play either.
+var (
+	onlineArtMu    sync.Mutex
+	onlineArtCache = map[string]image.Image{}
+)
+
+// onlineArtworkForTrack is the last-resort artwork source: it only runs once
+// a track's embedded tag art and any folder-level image (folder.jpg,
+// cover.png, etc.) have both come up empty. It looks the track up by
+// artist + title on iTunes's public Search API - no API key required - and
+// downloads the artwork iTunes has on file for it. Best-effort and silent:
+// no network, no match, or a bad image just returns nil, since this must
+// never block or break playback.
+func onlineArtworkForTrack(t Track) image.Image {
+	artist := strings.TrimSpace(t.Artist)
+	title := strings.TrimSpace(t.Title)
+	if artist == "" || title == "" {
+		return nil
+	}
+
+	key := strings.ToLower(artist) + "|" + strings.ToLower(title)
+	onlineArtMu.Lock()
+	if im, checked := onlineArtCache[key]; checked {
+		onlineArtMu.Unlock()
+		return im
+	}
+	onlineArtMu.Unlock()
+
+	im := fetchITunesArtwork(artist, title)
+
+	onlineArtMu.Lock()
+	onlineArtCache[key] = im
+	onlineArtMu.Unlock()
+	return im
+}
+
+func fetchITunesArtwork(artist, title string) image.Image {
+	term := url.QueryEscape(artist + " " + title)
+	searchURL := "https://itunes.apple.com/search?media=music&entity=song&limit=1&term=" + term
+	resp, err := onlineArtHTTPClient.Get(searchURL)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil
+	}
+
+	var result struct {
+		Results []struct {
+			ArtworkURL100 string `json:"artworkUrl100"`
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil || len(result.Results) == 0 {
+		return nil
+	}
+	artURL := result.Results[0].ArtworkURL100
+	if artURL == "" {
+		return nil
+	}
+	// iTunes serves a 100x100 thumbnail by default, but every size up to at
+	// least 600x600 is available at the same path by swapping the
+	// dimensions embedded in the filename.
+	artURL = strings.Replace(artURL, "100x100bb", "600x600bb", 1)
+
+	imResp, err := onlineArtHTTPClient.Get(artURL)
+	if err != nil {
+		return nil
+	}
+	defer imResp.Body.Close()
+	im, _, err := image.Decode(imResp.Body)
+	if err != nil {
+		return nil
+	}
+	return im
+}
+
 func trackFromTrack(src Track, prioritizeExternalArt bool) Track {
 	t := src
 	if prioritizeExternalArt && t.Art == nil {
@@ -2341,6 +2424,22 @@ func (p *Player) loadCurrentMetadata(index int, src Track) {
 				t.Art = p.externalArtworkForTrackCached(t)
 			}
 			t = trackFromTrack(t, false)
+		}
+		if t.Art == nil {
+			// Last resort: nothing embedded in the file and no folder image
+			// either, so look it up online. Use the artist/title already
+			// committed to the queue rather than this goroutine's local t -
+			// for FLAC in particular, those tags were read synchronously
+			// earlier in loadCurrentMetadata, not by anything above, so t
+			// itself may still be blank.
+			p.mu.Lock()
+			lookup := t
+			if index >= 0 && index < len(p.q.Tracks) && p.q.Tracks[index].Path == src.Path {
+				lookup.Artist = p.q.Tracks[index].Artist
+				lookup.Title = p.q.Tracks[index].Title
+			}
+			p.mu.Unlock()
+			t.Art = onlineArtworkForTrack(lookup)
 		}
 		p.commitTrackMetadata(index, src.Path, t)
 	}()
