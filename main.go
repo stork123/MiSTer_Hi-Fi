@@ -3724,11 +3724,23 @@ func drawNowPlayingBar(app *App, selected bool) int {
 	return h
 }
 
+// rowKind marks what a list row represents so menuWithEntryCounter can draw
+// a small leading icon for it. rowPlain (the zero value) draws no icon, so
+// every existing caller that doesn't care about icons is unaffected.
+type rowKind int
+
+const (
+	rowPlain rowKind = iota
+	rowFolder
+	rowTrack
+	rowDisc
+)
+
 func menu(app *App, title string, items []string, initial int) (int, bool) {
-	return menuWithEntryCounter(app, title, items, initial, false)
+	return menuWithEntryCounter(app, title, items, initial, false, nil)
 }
 
-func menuWithEntryCounter(app *App, title string, items []string, initial int, showEntryCounter bool) (int, bool) {
+func menuWithEntryCounter(app *App, title string, items []string, initial int, showEntryCounter bool, kinds []rowKind) (int, bool) {
 	fb, acts := app.fb, app.acts
 	clockTick := time.NewTicker(30 * time.Second)
 	defer clockTick.Stop()
@@ -3781,7 +3793,13 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 			if i == sel {
 				drawSelectionHighlight(fb, 45, y-5, fb.w-90, row-5)
 			}
-			fb.text(65, y+6, max(1, row/22), it, color.RGBA{235, 235, 235, 255})
+			textX := 65
+			if kinds != nil && i < len(kinds) && kinds[i] != rowPlain {
+				iconSize := max(12, row*2/5)
+				drawRowIcon(fb, 65+iconSize/2, y+row/2-2, iconSize, kinds[i])
+				textX = 65 + iconSize + 14
+			}
+			fb.text(textX, y+6, max(1, row/22), it, color.RGBA{235, 235, 235, 255})
 			y += row
 		}
 		if hasBar {
@@ -4045,8 +4063,15 @@ func browse(app *App, root, startDir, initialName string) (browseChoice, bool) {
 		sort.Slice(entries, func(i, j int) bool { return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name) })
 		items := make([]string, 1, len(entries)+1)
 		items[0] = "[..]"
+		kinds := make([]rowKind, 1, len(entries)+1)
+		kinds[0] = rowPlain
 		for _, entry := range entries {
 			items = append(items, entry.Name)
+			if entry.IsDir {
+				kinds = append(kinds, rowFolder)
+			} else {
+				kinds = append(kinds, rowTrack)
+			}
 		}
 		initial := 0
 		if focusName != "" {
@@ -4058,7 +4083,7 @@ func browse(app *App, root, startDir, initialName string) (browseChoice, bool) {
 			}
 		}
 		focusName = ""
-		i, ok := menuWithEntryCounter(app, "BROWSE: "+short(dir, 32), items, initial, true)
+		i, ok := menuWithEntryCounter(app, "BROWSE: "+short(dir, 32), items, initial, true, kinds)
 		if !ok {
 			if app.jumpSources || len(stack) == 1 {
 				return browseChoice{}, false
@@ -4342,6 +4367,66 @@ func drawEQIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
 			knobY = cy + size/5
 		}
 		fb.rect(x-size/9, knobY-size/10, size*2/9, size/5, c)
+	}
+}
+
+// fillCircle draws a solid filled disc, used by the small row icons below
+// (the framebuffer otherwise only offers rect/border-based primitives).
+func fillCircle(fb *framebuffer, cx, cy, r int, c color.RGBA) {
+	if r < 1 {
+		r = 1
+	}
+	for dy := -r; dy <= r; dy++ {
+		dx := int(math.Sqrt(float64(r*r - dy*dy)))
+		fb.rect(cx-dx, cy+dy, dx*2+1, 1, c)
+	}
+}
+
+// drawFolderIcon draws a small flat folder glyph marking a directory row in
+// a browse list.
+func drawFolderIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
+	w := size
+	h := size * 3 / 4
+	x := cx - w/2
+	y := cy - h/2 + size/8
+	tabW := w * 2 / 5
+	tabH := max(2, size/6)
+	fb.rect(x, y-tabH, tabW, tabH, c)
+	fb.rect(x, y, w, h, c)
+}
+
+// drawTrackIcon draws a small filled eighth-note glyph marking a playable
+// file row in a browse list.
+func drawTrackIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
+	noteR := max(2, size/5)
+	headCX := cx - size/5
+	headCY := cy + size/3
+	fillCircle(fb, headCX, headCY, noteR, c)
+	stemW := max(1, size/10)
+	stemX := headCX + noteR - stemW/2
+	stemTop := cy - size/2
+	fb.rect(stemX, stemTop, stemW, headCY-stemTop, c)
+	flagW := max(2, size/3)
+	fb.rect(stemX, stemTop, flagW, max(1, size/10), c)
+}
+
+// drawDiscIcon draws a small ring-with-hole glyph marking a disc image row
+// in the virtual CD browser.
+func drawDiscIcon(fb *framebuffer, cx, cy, size int, c, hole color.RGBA) {
+	fillCircle(fb, cx, cy, size/2, c)
+	fillCircle(fb, cx, cy, max(1, size/6), hole)
+}
+
+// drawRowIcon dispatches to the right small glyph for a browse-list row.
+func drawRowIcon(fb *framebuffer, cx, cy, size int, kind rowKind) {
+	c := color.RGBA{150, 168, 205, 255}
+	switch kind {
+	case rowFolder:
+		drawFolderIcon(fb, cx, cy, size, c)
+	case rowTrack:
+		drawTrackIcon(fb, cx, cy, size, c)
+	case rowDisc:
+		drawDiscIcon(fb, cx, cy, size, c, appBackground(nil))
 	}
 }
 
