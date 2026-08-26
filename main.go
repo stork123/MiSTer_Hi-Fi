@@ -3391,6 +3391,23 @@ type App struct {
 	virtualCD     *VirtualDisc
 }
 
+// uiAccent is the single accent color used app-wide to mark selection and
+// progress: the current row/control, the seek bar fill, and the title rule.
+// uiAccentDim is a muted, low-contrast tint of it used as a selected row's
+// background fill (this framebuffer has no real alpha blending, so the tint
+// is a hand-picked flat color rather than a computed blend).
+var uiAccent = color.RGBA{90, 150, 255, 255}
+var uiAccentDim = color.RGBA{24, 32, 52, 255}
+
+// drawSelectionHighlight paints the accent-tinted background and left accent
+// bar used to mark the selected row across the app's list-style menus
+// (sources, browse, settings, EQ), replacing the old plain white focus box.
+func drawSelectionHighlight(fb *framebuffer, x, y, w, h int) {
+	fb.rect(x, y, w, h, uiAccentDim)
+	barW := max(3, h/8)
+	fb.rect(x, y, barW, h, uiAccent)
+}
+
 func appBackground(cfg *Config) color.RGBA {
 	if cfg != nil && cfg.OLEDMode {
 		return color.RGBA{0, 0, 0, 255}
@@ -3560,7 +3577,7 @@ func (a *App) handlePlaybackShortcut(act action) bool {
 func drawTitle(fb *framebuffer, s string) {
 	white := color.RGBA{245, 245, 245, 255}
 	fb.text(30, 22, 3, s, white)
-	fb.rect(30, 52, fb.w-60, 2, color.RGBA{70, 70, 78, 255})
+	fb.rect(30, 52, fb.w-60, 2, uiAccent)
 }
 
 func drawWebRemoteAddress(app *App) {
@@ -3699,7 +3716,7 @@ func drawNowPlayingBar(app *App, selected bool) int {
 	bg := color.RGBA{24, 26, 33, 255}
 	fb.rect(30, y, fb.w-60, h, bg)
 	if selected {
-		fb.border(30, y, fb.w-60, h, 2, color.RGBA{245, 245, 245, 255})
+		fb.rect(30, y, max(3, h/8), h, uiAccent)
 	}
 	scale := max(1, h/24)
 	label := short(app.nowPlayingText(), max(20, (fb.w-100)/(6*scale)))
@@ -3762,8 +3779,7 @@ func menuWithEntryCounter(app *App, title string, items []string, initial int, s
 				continue
 			}
 			if i == sel {
-				fb.rect(45, y-5, fb.w-90, row-5, color.RGBA{35, 37, 46, 255})
-				fb.border(45, y-5, fb.w-90, row-5, 2, color.RGBA{240, 240, 240, 255})
+				drawSelectionHighlight(fb, 45, y-5, fb.w-90, row-5)
 			}
 			fb.text(65, y+6, max(1, row/22), it, color.RGBA{235, 235, 235, 255})
 			y += row
@@ -4443,7 +4459,7 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 		cx := x + cellW/2
 		cy := l.ctrlY + boxH/2 - scaledPx(l.scale, 9)
 		if sel == i+1 {
-			fb.border(x+scaledPx(l.scale, 5), l.ctrlY-scaledPx(l.scale, 10), cellW-scaledPx(l.scale, 10), boxH, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
+			fb.border(x+scaledPx(l.scale, 5), l.ctrlY-scaledPx(l.scale, 10), cellW-scaledPx(l.scale, 10), boxH, scaledPx(l.scale, 2), uiAccent)
 		}
 		c := color.RGBA{225, 225, 230, 255}
 		switch i {
@@ -4518,7 +4534,7 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 	barClearPad := barBoxPad + scaledPx(l.scale, 2)
 	fb.rect(l.rightX-barClearPad, l.barY-barClearPad, l.rightW+barClearPad*2, l.barH+barClearPad*2, bg)
 	if sel == 0 {
-		fb.border(l.rightX-barBoxPad, l.barY-barBoxPad, l.rightW+barBoxPad*2, l.barH+barBoxPad*2, scaledPx(l.scale, 2), color.RGBA{255, 255, 255, 255})
+		fb.border(l.rightX-barBoxPad, l.barY-barBoxPad, l.rightW+barBoxPad*2, l.barH+barBoxPad*2, scaledPx(l.scale, 2), uiAccent)
 	}
 	fb.rect(l.rightX, l.barY, l.rightW, l.barH, color.RGBA{75, 75, 82, 255})
 	fill := 0
@@ -4532,7 +4548,7 @@ func drawPlayerDynamic(fb *framebuffer, p *Player, l playerLayout, sel int, cfg 
 		}
 		fill = int(float64(l.rightW) * ratio)
 	}
-	fb.rect(l.rightX, l.barY, fill, l.barH, color.RGBA{240, 240, 240, 255})
+	fb.rect(l.rightX, l.barY, fill, l.barH, uiAccent)
 }
 
 func playerTrackKey(p *Player) string {
@@ -4758,8 +4774,7 @@ func eqUI(app *App) {
 		y := 70
 		for i, n := range names {
 			if i == sel {
-				fb.rect(40, y-5, fb.w-80, row-3, color.RGBA{34, 36, 45, 255})
-				fb.border(40, y-5, fb.w-80, row-3, 2, color.RGBA{245, 245, 245, 255})
+				drawSelectionHighlight(fb, 40, y-5, fb.w-80, row-3)
 			}
 			fb.text(60, y+5, max(1, row/24), n, color.RGBA{235, 235, 235, 255})
 			if vals[i] != "" {
@@ -5173,8 +5188,7 @@ func settingsUI(app *App) {
 			y := y0 + i*row
 			rowEnabled := enabled(i)
 			if sel == i && rowEnabled {
-				fb.rect(45, y-4, fb.w-90, row-3, color.RGBA{35, 37, 46, 255})
-				fb.border(45, y-4, fb.w-90, row-3, 2, color.RGBA{240, 240, 240, 255})
+				drawSelectionHighlight(fb, 45, y-4, fb.w-90, row-3)
 			}
 			labelColor := color.RGBA{235, 235, 235, 255}
 			valueColor := color.RGBA{200, 200, 205, 255}
