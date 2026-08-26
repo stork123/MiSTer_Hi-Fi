@@ -5436,8 +5436,15 @@ func confirmExitUI(app *App) bool {
 			switch a {
 			case actConfirm:
 				return true
-			case actBack, actSources, actWake:
+			case actBack, actSources:
 				return false
+			case actWake:
+				// The screensaver swallows whatever button woke the display
+				// and reports it as actWake instead, so the press that was
+				// meant to wake the screen doesn't also get treated as
+				// "cancel" here. Just redraw (the dialog was never actually
+				// visible while the screen was asleep) and wait for a real
+				// answer.
 			}
 		case raw := <-app.external:
 			if err := app.startExternal(raw); err == nil {
