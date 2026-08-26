@@ -299,10 +299,16 @@ func browseVirtualCD(app *App, root string) (string, bool) {
 		}
 		sort.Slice(entries, func(i, j int) bool { return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name) })
 		items := []string{"[..]"}
+		kinds := []rowKind{rowPlain}
 		for _, entry := range entries {
 			items = append(items, entry.Name)
+			if entry.IsDir {
+				kinds = append(kinds, rowFolder)
+			} else {
+				kinds = append(kinds, rowDisc)
+			}
 		}
-		i, ok := menuWithEntryCounter(app, "SELECT VIRTUAL CD: "+short(dir, 26), items, 0, true)
+		i, ok := menuWithEntryCounter(app, "SELECT VIRTUAL CD: "+short(dir, 26), items, 0, true, kinds)
 		if !ok {
 			if app.jumpSources || len(stack) == 1 {
 				return "", false
