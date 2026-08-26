@@ -100,6 +100,10 @@ type Queue struct {
 	Repeat, Shuffle bool
 	DirFD           int
 	UseDirFD        bool
+	// ExtraDirFDs holds directory file descriptors picked up from folders
+	// appended to this queue after it was first built (see appendQueue) so
+	// closeQueueDirFD can release every one of them, not just the original.
+	ExtraDirFDs []int
 }
 
 type fbVar struct {
@@ -3261,6 +3265,55 @@ func (p *Player) next() {
 	p.mu.Unlock()
 	_ = p.playCurrentUnlocked()
 }
+
+// playIndex jumps directly to a specific queue position, used by the queue
+// view screen when the user picks a track other than the one currently
+// playing.
+func (p *Player) playIndex(i int) {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.mu.Lock()
+	if i >= 0 && i < len(p.q.Tracks) {
+		p.q.Index = i
+	}
+	p.mu.Unlock()
+	_ = p.playCurrentUnlocked()
+}
+
+// appendQueue merges another queue's tracks onto the end of this one without
+// interrupting whatever is already playing. It's used by "ADD TO QUEUE" when
+// browsing: a folder or track can be queued up behind what's currently
+// playing instead of replacing it outright. If nothing is currently playing
+// (the queue previously ran out, or this player was just created empty), the
+// newly appended tracks start playing immediately instead of sitting
+// unreachable behind a stopped player. Any directory file descriptor the
+// incoming queue was using is handed over so it still gets closed later.
+func (p *Player) appendQueue(q Queue) {
+	if len(q.Tracks) == 0 {
+		return
+	}
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+	p.mu.Lock()
+	if q.UseDirFD && q.DirFD >= 0 {
+		p.q.ExtraDirFDs = append(p.q.ExtraDirFDs, q.DirFD)
+	}
+	resumeAt := -1
+	if p.stopped {
+		resumeAt = len(p.q.Tracks)
+	}
+	p.q.Tracks = append(p.q.Tracks, q.Tracks...)
+	if resumeAt >= 0 {
+		p.q.Index = resumeAt
+	}
+	p.mu.Unlock()
+	if resumeAt >= 0 {
+		_ = p.playCurrentUnlocked()
+		return
+	}
+	p.prepareGaplessNextFile()
+}
+
 func (p *Player) togglePause() {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
@@ -3455,19 +3508,25 @@ func drawClock(fb *framebuffer, cfg *Config, bg color.RGBA) (int, int, int, int)
 }
 
 func closeQueueDirFD(q *Queue) {
-	if q == nil || !q.UseDirFD || q.DirFD < 0 {
+	if q == nil {
 		return
 	}
-	fd := q.DirFD
+	fds := q.ExtraDirFDs
+	q.ExtraDirFDs = nil
+	if q.UseDirFD && q.DirFD >= 0 {
+		fds = append(fds, q.DirFD)
+	}
 	q.DirFD = -1
 	q.UseDirFD = false
-	for i := range q.Tracks {
-		if q.Tracks[i].UseDirFD && q.Tracks[i].DirFD == fd {
-			q.Tracks[i].DirFD = -1
-			q.Tracks[i].UseDirFD = false
+	for _, fd := range fds {
+		for i := range q.Tracks {
+			if q.Tracks[i].UseDirFD && q.Tracks[i].DirFD == fd {
+				q.Tracks[i].DirFD = -1
+				q.Tracks[i].UseDirFD = false
+			}
 		}
+		_ = syscall.Close(fd)
 	}
-	_ = syscall.Close(fd)
 }
 
 func (a *App) startQueue(q Queue, origin *browseOrigin) error {
@@ -3678,6 +3737,18 @@ func drawBrowserFooter(fb *framebuffer, jump bool) {
 		x = drawFooterPair(fb, x, cy, icon, ts, "lr", "JUMP 5", c)
 	}
 	x = drawFooterPair(fb, x, cy, icon, ts, "a", "OPEN", c)
+	x = drawFooterPair(fb, x, cy, icon, ts, "b", "BACK", c)
+	_ = drawFooterPair(fb, x, cy, icon, ts, "home", "SOURCES", c)
+}
+
+func drawQueueFooter(fb *framebuffer) {
+	c := color.RGBA{160, 160, 165, 255}
+	ts := max(1, fb.h/540)
+	icon := max(14, 14*ts)
+	cy := fb.h - max(18, icon/2+7)
+	x := 30
+	x = drawFooterPair(fb, x, cy, icon, ts, "ud", "NAVIGATE", c)
+	x = drawFooterPair(fb, x, cy, icon, ts, "a", "PLAY", c)
 	x = drawFooterPair(fb, x, cy, icon, ts, "b", "BACK", c)
 	_ = drawFooterPair(fb, x, cy, icon, ts, "home", "SOURCES", c)
 }
@@ -4370,6 +4441,19 @@ func drawEQIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
 	}
 }
 
+// drawQueueIcon draws a small stacked-lines glyph representing the play
+// queue, used as the eighth control on the Now Playing screen.
+func drawQueueIcon(fb *framebuffer, cx, cy, size int, c color.RGBA) {
+	barH := max(2, size/6)
+	gap := max(2, size/5+barH)
+	widths := []int{size, size * 3 / 4, size}
+	y := cy - gap
+	for _, w := range widths {
+		fb.rect(cx-w/2, y, w, barH, c)
+		y += gap
+	}
+}
+
 // fillCircle draws a solid filled disc, used by the small row icons below
 // (the framebuffer otherwise only offers rect/border-based primitives).
 func fillCircle(fb *framebuffer, cx, cy, r int, c color.RGBA) {
@@ -4532,7 +4616,7 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 	if ctrlH > 0 {
 		fb.rect(ctrlX, ctrlTop, ctrlW, ctrlH, bg)
 	}
-	count := 7
+	count := 8
 	cellW := ctrlW / count
 	boxH := scaledPx(l.scale, 76)
 	iconSize := scaledPx(l.scale, 42)
@@ -4572,6 +4656,8 @@ func drawPlayerControls(fb *framebuffer, p *Player, sel int, l playerLayout, pau
 			}
 		case 6:
 			drawEQIcon(fb, cx, cy, iconSize, c)
+		case 7:
+			drawQueueIcon(fb, cx, cy, iconSize, c)
 		}
 	}
 
@@ -4708,7 +4794,7 @@ func playerUI(app *App) {
 			case actRight:
 				if sel == 0 {
 					p.seekBy(10)
-				} else if sel < 7 {
+				} else if sel < 8 {
 					sel++
 					redrawControls = true
 				}
@@ -4735,7 +4821,7 @@ func playerUI(app *App) {
 				sel = 1
 				redrawControls = true
 			case actLast:
-				sel = 7
+				sel = 8
 				redrawControls = true
 			case actStop:
 				external := app.origin == nil
@@ -4799,6 +4885,12 @@ func playerUI(app *App) {
 					}
 					p.cfg = *cfg
 					nativeAudioSetEQ(cfg.EQ)
+					fullRedraw = true
+				case 8:
+					queueUI(app)
+					if app.jumpSources {
+						return
+					}
 					fullRedraw = true
 				}
 			}
@@ -5095,6 +5187,156 @@ func currentReturnName(app *App, origin *browseOrigin) string {
 	return name
 }
 
+// queueUI shows every track in the current player's queue, in play order,
+// with the currently playing track marked. Confirming a row jumps playback
+// straight to that track; Back returns to Now Playing without changing
+// anything.
+func queueUI(app *App) {
+	p := app.player
+	if p == nil {
+		return
+	}
+	fb, acts, cfg := app.fb, app.acts, app.cfg
+	p.mu.Lock()
+	sel := p.q.Index
+	p.mu.Unlock()
+	if sel < 0 {
+		sel = 0
+	}
+	clockTick := time.NewTicker(30 * time.Second)
+	defer clockTick.Stop()
+	for {
+		if app.jumpSources {
+			return
+		}
+		p.mu.Lock()
+		tracks := append([]Track(nil), p.q.Tracks...)
+		curIdx := p.q.Index
+		p.mu.Unlock()
+		if len(tracks) == 0 {
+			message(app, "QUEUE", "THE QUEUE IS EMPTY")
+			return
+		}
+		if sel >= len(tracks) {
+			sel = len(tracks) - 1
+		}
+		if sel < 0 {
+			sel = 0
+		}
+		fb.fill(appBackground(cfg))
+		drawTitle(fb, "QUEUE")
+		drawWebRemoteAddress(app)
+		row := max(30, fb.h/10)
+		maxRows := (fb.h - 70 - 45) / row
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		first := 0
+		if sel >= maxRows {
+			first = sel - maxRows + 1
+		}
+		if first+maxRows > len(tracks) {
+			first = len(tracks) - maxRows
+			if first < 0 {
+				first = 0
+			}
+		}
+		y := 70
+		for i := first; i < len(tracks) && i < first+maxRows; i++ {
+			if i == sel {
+				drawSelectionHighlight(fb, 45, y-5, fb.w-90, row-5)
+			}
+			iconSize := max(12, row*2/5)
+			iconCX, iconCY := 65+iconSize/2, y+row/2-2
+			textColor := color.RGBA{235, 235, 235, 255}
+			if i == curIdx {
+				drawPlayIcon(fb, iconCX, iconCY, iconSize, uiAccent)
+				textColor = uiAccent
+			} else {
+				drawTrackIcon(fb, iconCX, iconCY, iconSize, color.RGBA{150, 168, 205, 255})
+			}
+			label := tracks[i].Title
+			if label == "" {
+				label = filepath.Base(tracks[i].Path)
+			}
+			fb.text(65+iconSize+14, y+6, max(1, row/22), label, textColor)
+			y += row
+		}
+		counter := fmt.Sprintf("%d / %d", sel+1, len(tracks))
+		scale := max(1, fb.h/540)
+		fb.text(fb.w-30-tw(scale, counter), fb.h-max(25, scale*12), scale, counter, color.RGBA{160, 160, 165, 255})
+		drawQueueFooter(fb)
+		drawClock(fb, cfg, appBackground(cfg))
+		fb.present()
+
+		var a action
+		select {
+		case <-clockTick.C:
+			continue
+		case a = <-acts:
+		case raw := <-app.external:
+			if err := app.startExternal(raw); err == nil {
+				return
+			}
+			continue
+		case <-app.webStop:
+			app.jumpSources = true
+			return
+		}
+		switch a {
+		case actUp:
+			if sel > 0 {
+				sel--
+			}
+		case actDown:
+			if sel < len(tracks)-1 {
+				sel++
+			}
+		case actPageUp:
+			sel -= 10
+			if sel < 0 {
+				sel = 0
+			}
+		case actPageDown:
+			sel += 10
+			if sel >= len(tracks) {
+				sel = len(tracks) - 1
+			}
+		case actFirst:
+			sel = 0
+		case actLast:
+			sel = len(tracks) - 1
+		case actConfirm:
+			p.playIndex(sel)
+			return
+		case actBack, actNowPlaying:
+			return
+		case actSources:
+			app.jumpSources = true
+			return
+		case actStop:
+			external := app.origin == nil
+			app.stopAndUnload()
+			if external {
+				app.jumpSources = true
+			}
+			return
+		}
+	}
+}
+
+// chooseQueueAction asks whether a freshly browsed track/folder should
+// replace the running queue or be appended to it. It's only ever shown when
+// something is already loaded; browsing with nothing playing always plays
+// immediately, exactly like before this existed.
+func chooseQueueAction(app *App) (add bool, chosen bool) {
+	i, ok := menu(app, "PLAYBACK", []string{"PLAY NOW", "ADD TO QUEUE"}, 0)
+	if !ok {
+		return false, false
+	}
+	return i == 1, true
+}
+
 func runBrowserSource(app *App, root, kind string) {
 	startDir := root
 	selected := ""
@@ -5105,6 +5347,24 @@ func runBrowserSource(app *App, root, kind string) {
 		}
 		origin := &browseOrigin{Root: root, Dir: choice.Dir, Selected: choice.Name, Kind: kind}
 		recursive := app.cfg != nil && app.cfg.RecursiveFolders
+		if app.player != nil {
+			add, chosen := chooseQueueAction(app)
+			if !chosen {
+				startDir, selected = choice.Dir, choice.Name
+				continue
+			}
+			if add {
+				q := buildQueueFromChoice(choice, recursive)
+				if len(q.Tracks) == 0 {
+					message(app, "ADD TO QUEUE", "NO SUPPORTED AUDIO FILES FOUND")
+				} else {
+					app.player.appendQueue(q)
+					message(app, "ADDED TO QUEUE", fmt.Sprintf("%d TRACK(S) ADDED", len(q.Tracks)))
+				}
+				startDir, selected = choice.Dir, choice.Name
+				continue
+			}
+		}
 		if err := app.startQueue(buildQueueFromChoice(choice, recursive), origin); err != nil {
 			message(app, "PLAYBACK ERROR", err.Error())
 			startDir, selected = choice.Dir, choice.Name
